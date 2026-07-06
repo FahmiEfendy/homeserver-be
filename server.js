@@ -79,8 +79,6 @@ const server = http.createServer((req, res) => {
                 temp: temp
             };
 
-            console.log(`[DEBUG] Vitals successfully fetched: CPU ${vitals.cpuLoad}% | RAM ${vitals.ramUsed}GB | Temp ${vitals.temp}`);
-
             res.writeHead(200);
             res.end(JSON.stringify(vitals));
         } else if (req.url === '/docker') {
@@ -115,8 +113,6 @@ const server = http.createServer((req, res) => {
 					}
 				});
 
-				console.log(`[DEBUG] Docker stats successfully fetched for ${stats.length} containers`);
-
                 res.writeHead(200);
                 res.end(JSON.stringify(stats));
             } catch (e) {
@@ -128,7 +124,6 @@ const server = http.createServer((req, res) => {
             res.writeHead(200);
             res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
         } else {
-            console.log(`[DEBUG] 404 Not Found for ${req.url}`);
             res.writeHead(404);
             res.end();
         }
