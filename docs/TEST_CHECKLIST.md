@@ -11,7 +11,7 @@ Manual and automated test procedures for validating the backend service.
 - [ ] Returns `200` with `{ "status": "ok", "uptime": <number> }`
 - [ ] `uptime` value increases between requests
 - [ ] Response `Content-Type` is `application/json`
-- [ ] CORS header `Access-Control-Allow-Origin: *` is present
+- [ ] CORS header is present when `Origin` matches `ALLOWED_ORIGINS`
 
 ### `GET /vitals`
 
@@ -25,16 +25,19 @@ Manual and automated test procedures for validating the backend service.
 ### `GET /docker`
 
 - [ ] Returns `200` with a JSON array
-- [ ] Each entry contains: `Name`, `CPUPerc`, `MemUsage`, `NetIO`, `Status`
+- [ ] Each entry contains: `Name`, `CPUPerc`, `MemUsage`, `NetIO`, `Status`, `Group`
+- [ ] `Group` is one of: `database`, `monitoring`, `infra`, `media`, `app`
 - [ ] `Status` field includes health status (e.g., `"Up 3 hours (healthy)"`)
 - [ ] Public app containers include `Branch` field (e.g., `"main"`)
 - [ ] Non-app containers do not include `Branch` field
-- [ ] All 19 monitored containers are listed when all are running
+- [ ] All monitored containers are listed when all are running
 - [ ] Response completes within 10 seconds
+- [ ] Second call within 5 s returns the cached result (no Docker CLI re-execution)
+- [ ] After Docker socket failure, next call returns `500` (not stale data)
 
 ### Unknown Routes
 
-- [ ] `GET /unknown` returns `404` with empty body
+- [ ] `GET /unknown` returns `404` with JSON body `{ "error": "Not Found" }`
 - [ ] `GET /api/vitals` returns `404` (no `/api` prefix)
 
 ---
@@ -83,7 +86,7 @@ Manual and automated test procedures for validating the backend service.
 - [ ] `/docker` returns `500` when stats output cannot be parsed
 - [ ] `/vitals` gracefully handles missing temperature sensor (`"N/A"`)
 - [ ] `/vitals` gracefully handles missing disk info (`"N/A"`)
-- [ ] Server logs errors with `[DEBUG]` prefix for troubleshooting
+- [ ] Server logs errors as structured JSON with `level: "error"` for troubleshooting
 
 ---
 
@@ -93,3 +96,50 @@ Manual and automated test procedures for validating the backend service.
 - [ ] `/vitals` responds in < 3s under normal load
 - [ ] `/docker` responds in < 10s with all containers running
 - [ ] Memory usage stays below 128MB under sustained polling (every 5s for 5 min)
+
+---
+
+## Rate Limiting
+
+- [ ] Sending 101 requests from the same IP within 60 s returns `429` on the 101st
+- [ ] `Retry-After` header is present on `429` responses (value in seconds)
+- [ ] A different IP is not affected by another IP's rate limit
+- [ ] Rate limit window resets after 60 s
+
+---
+
+## CORS & Preflight
+
+- [ ] `OPTIONS` request returns `204 No Content` with `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers`
+- [ ] Allowed origin receives `Access-Control-Allow-Origin` reflecting the request `Origin`
+- [ ] Allowed origin response includes `Vary: Origin`
+- [ ] Disallowed origin does not receive `Access-Control-Allow-Origin` header
+- [ ] Wildcard mode (`ALLOWED_ORIGINS=*`) returns `Access-Control-Allow-Origin: *`
+
+---
+
+## Structured JSON Logging
+
+- [ ] Each HTTP request produces a single JSON log line on stdout
+- [ ] Log line contains: `timestamp`, `level`, `message`, `method`, `url`, `status`, `durationMs`, `ip`
+- [ ] Error conditions (Docker failure, rate limit) log a `warn` or `error` level entry
+- [ ] Unhandled promise rejections are logged as `error` and do not crash the process
+
+---
+
+## Prometheus `/metrics`
+
+- [ ] Returns `200` with `Content-Type: text/plain; version=0.0.4`
+- [ ] Contains `node_process_uptime_seconds` gauge
+- [ ] Contains `node_process_memory_usage_bytes` with `rss`, `heapTotal`, `heapUsed` labels
+- [ ] Contains `http_requests_total` counter with `method`, `endpoint`, `status` labels
+- [ ] Counter increments on subsequent requests
+
+---
+
+## Graceful Shutdown
+
+- [ ] Sending `SIGTERM` calls `server.close()` and exits with code `0`
+- [ ] Sending `SIGINT` (Ctrl+C) calls `server.close()` and exits with code `0`
+- [ ] Shutdown logs `{ level: "info", message: "HTTP server closed. Exiting process." }`
+- [ ] Process force-exits after 10 s if open connections prevent clean shutdown (exit code `1`)

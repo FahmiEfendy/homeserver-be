@@ -11,9 +11,11 @@ A lightweight HTTP server built with Node's native `http` module that provides r
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/vitals` | System vitals — CPU load, RAM usage, disk usage, temperature |
-| `GET` | `/docker` | Docker container stats — CPU%, memory, network I/O, status, git branch |
+| `GET` | `/docker` | Docker container stats — CPU%, memory, network I/O, status, group, git branch |
+| `GET` | `/metrics` | Prometheus metrics — process uptime, memory, HTTP request counters |
 | `GET` | `/health` | Health check — returns `{ status: "ok", uptime: <seconds> }` |
-| `*` | `*` | 404 — all other routes |
+| `OPTIONS` | `*` | CORS preflight — returns `204 No Content` with CORS headers |
+| `*` | `*` | 404 — all other routes return `{ "error": "Not Found" }` |
 
 ### `GET /vitals`
 
@@ -31,7 +33,7 @@ Returns current host system metrics:
 
 ### `GET /docker`
 
-Returns stats for all running Docker containers with merged status and git branch info:
+Returns stats for all running Docker containers with merged status, group classification, and git branch info:
 
 ```json
 [
@@ -41,9 +43,30 @@ Returns stats for all running Docker containers with merged status and git branc
     "MemUsage": "45.2MiB / 256MiB",
     "NetIO": "1.2kB / 3.4kB",
     "Status": "Up 3 hours (healthy)",
+    "Group": "app",
     "Branch": "main"
   }
 ]
+```
+
+Response is cached for **5 seconds** to protect the Docker socket from concurrent hammering.
+
+### `GET /metrics`
+
+Returns Prometheus-compatible plain text (`text/plain; version=0.0.4`):
+
+```
+# HELP node_process_uptime_seconds Uptime of the Node.js process in seconds.
+# TYPE node_process_uptime_seconds gauge
+node_process_uptime_seconds 3600.123
+
+# HELP node_process_memory_usage_bytes Memory usage in bytes.
+# TYPE node_process_memory_usage_bytes gauge
+node_process_memory_usage_bytes{type="rss"} 28311552
+
+# HELP http_requests_total Total number of HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="GET",endpoint="/vitals",status="200"} 42
 ```
 
 ## Monitored Containers
@@ -88,18 +111,20 @@ For public-facing apps, the backend reads `.git/HEAD` to determine the active br
 ## Architecture
 
 ```
-┌──────────────────────────────────────┐
+┌────────────────────────────────────────┐
 │           be-homeserver              │
 │  ┌────────────────────────────────┐  │
 │  │  Node.js HTTP Server (:3002)  │  │
 │  │  ├── /vitals → os module      │  │
 │  │  ├── /docker → docker CLI     │  │
+│  │  ├── /metrics → prom format   │  │
 │  │  └── /health → uptime check   │  │
 │  └────────────────────────────────┘  │
 │                                      │
-│  Dependencies:                       │
-│  • morgan (HTTP request logging)     │
-│  • docker-cli (apk, in container)   │
+│  Middleware:                          │
+│  • Rate limiting (100 req/min/IP)   │
+│  • JSON request logger              │
+│  • Dynamic CORS (ALLOWED_ORIGINS)   │
 │                                      │
 │  Mounts:                             │
 │  • /var/run/docker.sock (ro)         │
@@ -109,7 +134,16 @@ For public-facing apps, the backend reads `.git/HEAD` to determine the active br
 
 ## Environment Variables
 
-This service has no application-level environment variables. The port (`3002`) is hardcoded in `server.js`.
+Configure via a `.env` file or shell environment. Copy `.env.example` to get started:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3002` | Port the HTTP server listens on |
+| `ALLOWED_ORIGINS` | `*` (all) | Comma-separated list of allowed CORS origins (e.g. `http://localhost:4321,https://homeserver.local`) |
 
 ## Local Development
 

@@ -17,7 +17,21 @@ const log = (level, message, meta = {}) => {
     }));
 };
 
-const PORT = 3002;
+const rawPort = parseInt(process.env.PORT);
+const PORT = !isNaN(rawPort) && rawPort > 0 ? rawPort : 3002;
+
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : ['*'];
+
+const sendError = (res, statusCode, message, headers = {}) => {
+    log('warn', `HTTP error response: ${message}`, { statusCode });
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json',
+        ...headers
+    });
+    res.end(JSON.stringify({ error: message }));
+};
 
 const CONTAINER_PATHS = {
     'homeserver-fe': '/homeserver/apps/homeserver/fe-homeserver',
@@ -95,11 +109,9 @@ const checkRateLimit = (req, res) => {
         const resetTimeMs = oldestActive + RATE_LIMIT_WINDOW_MS;
         const retryAfterSeconds = Math.max(1, Math.ceil((resetTimeMs - now) / 1000));
 
-        res.writeHead(429, {
-            'Retry-After': String(retryAfterSeconds),
-            'Content-Type': 'application/json'
+        sendError(res, 429, 'Too many requests, please try again later.', {
+            'Retry-After': String(retryAfterSeconds)
         });
-        res.end(JSON.stringify({ error: 'Too many requests, please try again later.' }));
         return false;
     }
 
@@ -188,6 +200,11 @@ const fetchDockerStatsAndCache = async () => {
             cachedDockerStats = stats;
             lastDockerStatsFetchTime = Date.now();
             return stats;
+        } catch (e) {
+            // Invalidate cache on error to prevent stale data from being served
+            cachedDockerStats = null;
+            lastDockerStatsFetchTime = 0;
+            throw e;
         } finally {
             activeDockerStatsPromise = null;
         }
@@ -218,7 +235,22 @@ const requestLogger = (req, res, next) => {
 
 const server = http.createServer((req, res) => {
     requestLogger(req, res, async () => {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        const origin = req.headers.origin;
+        if (ALLOWED_ORIGINS.includes('*')) {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+        } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Vary', 'Origin');
+        }
+
+        if (req.method === 'OPTIONS') {
+            res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+
         res.setHeader('Content-Type', 'application/json');
 
         if (req.url === '/vitals') {
@@ -257,8 +289,7 @@ const server = http.createServer((req, res) => {
                 res.end(JSON.stringify(stats));
             } catch (e) {
                 log('error', `Failed to fetch/parse docker stats`, { error: e.message });
-                res.writeHead(500);
-                res.end(JSON.stringify({ error: 'Failed to fetch docker stats' }));
+                sendError(res, 500, 'Failed to fetch docker stats');
             }
         } else if (req.url === '/metrics') {
             const memory = process.memoryUsage();
@@ -287,12 +318,32 @@ const server = http.createServer((req, res) => {
             res.writeHead(200);
             res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
         } else {
-            res.writeHead(404);
-            res.end();
+            sendError(res, 404, 'Not Found');
         }
     });
 });
 
 server.listen(PORT, () => {
     log('info', `Vitals API running on port ${PORT}`);
+});
+
+const shutdown = (signal) => {
+    log('info', `Received ${signal}, starting graceful shutdown.`);
+    server.close(() => {
+        log('info', 'HTTP server closed. Exiting process.');
+        process.exit(0);
+    });
+    
+    // Force close after 10 seconds if connections are hanging
+    setTimeout(() => {
+        log('error', 'Force exiting due to hanging connections.');
+        process.exit(1);
+    }, 10000).unref();
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+    log('error', 'Unhandled promise rejection', { reason: String(reason) });
 });
