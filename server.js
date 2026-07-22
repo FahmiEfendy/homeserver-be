@@ -1,9 +1,21 @@
 const http = require('http');
 const os = require('os');
 const { exec } = require('child_process');
-const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
+
+const metrics = {
+    requestsTotal: new Map() // key: 'method:endpoint:status' -> count
+};
+
+const log = (level, message, meta = {}) => {
+    console.log(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level,
+        message,
+        ...meta
+    }));
+};
 
 const PORT = 3002;
 
@@ -45,7 +57,7 @@ const getGitBranch = (targetPath) => {
 const runCmd = (cmd, timeoutMs = 5000) => new Promise(resolve => {
     exec(cmd, { timeout: timeoutMs }, (error, stdout, stderr) => {
         if (error) {
-            console.error(`[DEBUG] Command failed: ${cmd}\nError: ${error.message}\nStderr: ${stderr}`);
+            log('error', `Command failed: ${cmd}`, { error: error.message, stderr });
             resolve(null);
         } else {
             resolve(stdout.trim());
@@ -69,20 +81,20 @@ const getClientIp = (req) => {
 const checkRateLimit = (req, res) => {
     const ip = getClientIp(req);
     const now = Date.now();
-    
+
     if (!rateLimitStore.has(ip)) {
         rateLimitStore.set(ip, []);
     }
-    
+
     const timestamps = rateLimitStore.get(ip);
     const active = timestamps.filter(time => now - time < RATE_LIMIT_WINDOW_MS);
-    
+
     if (active.length >= RATE_LIMIT_MAX) {
         rateLimitStore.set(ip, active);
         const oldestActive = active[0];
         const resetTimeMs = oldestActive + RATE_LIMIT_WINDOW_MS;
         const retryAfterSeconds = Math.max(1, Math.ceil((resetTimeMs - now) / 1000));
-        
+
         res.writeHead(429, {
             'Retry-After': String(retryAfterSeconds),
             'Content-Type': 'application/json'
@@ -90,7 +102,7 @@ const checkRateLimit = (req, res) => {
         res.end(JSON.stringify({ error: 'Too many requests, please try again later.' }));
         return false;
     }
-    
+
     active.push(now);
     rateLimitStore.set(ip, active);
     return true;
@@ -109,15 +121,103 @@ setInterval(() => {
     }
 }, 60000).unref();
 
-const logger = morgan('dev');
+const getContainerGroup = (name) => {
+    const lower = name.toLowerCase();
+    if (lower.includes('db-') || lower.includes('postgres') || lower.includes('mysql') || lower.includes('mongo') || lower.includes('redis') || lower.includes('mariadb')) {
+        return 'database';
+    }
+    if (lower.includes('monitoring') || lower.includes('prometheus') || lower.includes('grafana') || lower.includes('loki') || lower.includes('promtail') || lower.includes('cadvisor') || lower.includes('node-exporter') || lower.includes('nginx-exporter')) {
+        return 'monitoring';
+    }
+    if (lower.includes('infra-') || lower.includes('nginx') || lower.includes('portainer') || lower.includes('watchtower')) {
+        return 'infra';
+    }
+    if (lower.includes('media-') || lower.includes('jellyfin') || lower.includes('plex') || lower.includes('openinary')) {
+        return 'media';
+    }
+    return 'app';
+};
+
+let cachedDockerStats = null;
+let lastDockerStatsFetchTime = 0;
+const CACHE_DURATION_MS = 5000; // 5 seconds cache
+let activeDockerStatsPromise = null;
+
+const fetchDockerStatsAndCache = async () => {
+    const now = Date.now();
+    if (cachedDockerStats && (now - lastDockerStatsFetchTime < CACHE_DURATION_MS)) {
+        return cachedDockerStats;
+    }
+    
+    if (activeDockerStatsPromise) {
+        return activeDockerStatsPromise;
+    }
+    
+    activeDockerStatsPromise = (async () => {
+        try {
+            const [statsOut, psOut] = await Promise.all([
+                runCmd("docker stats --no-stream --format '{{json .}}'"),
+                runCmd("docker ps -a --format '{\"Name\":\"{{.Names}}\", \"Status\":\"{{.Status}}\"}'")
+            ]);
+            
+            if (!statsOut) {
+                throw new Error('Failed to fetch docker stats');
+            }
+            
+            const stats = statsOut.split('\n').filter(Boolean).map(JSON.parse);
+            const psInfo = psOut ? psOut.split('\n').filter(Boolean).map(JSON.parse) : [];
+            
+            stats.forEach(stat => {
+                const psMatch = psInfo.find(p => p.Name === stat.Name);
+                stat.Status = psMatch ? psMatch.Status : 'Unknown';
+                
+                // Grouping
+                stat.Group = getContainerGroup(stat.Name);
+                
+                // Attach git branch if it's a public app
+                const nameLower = stat.Name.toLowerCase();
+                const pathKey = Object.keys(CONTAINER_PATHS).find(k => nameLower.includes(k.toLowerCase()));
+                if (pathKey) {
+                    const branch = getGitBranch(CONTAINER_PATHS[pathKey]);
+                    if (branch) {
+                        stat.Branch = branch;
+                    }
+                }
+            });
+            
+            cachedDockerStats = stats;
+            lastDockerStatsFetchTime = Date.now();
+            return stats;
+        } finally {
+            activeDockerStatsPromise = null;
+        }
+    })();
+    
+    return activeDockerStatsPromise;
+};
+
+const requestLogger = (req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        log('info', 'HTTP request', {
+            method: req.method,
+            url: req.url,
+            status: res.statusCode,
+            durationMs: duration,
+            ip: getClientIp(req)
+        });
+        
+        // Track metric
+        const endpoint = req.url.split('?')[0];
+        const key = `${req.method}:${endpoint}:${res.statusCode}`;
+        metrics.requestsTotal.set(key, (metrics.requestsTotal.get(key) || 0) + 1);
+    });
+    next();
+};
 
 const server = http.createServer((req, res) => {
-    logger(req, res, async (err) => {
-        if (err) {
-            res.writeHead(500);
-            return res.end('Error');
-        }
-
+    requestLogger(req, res, async () => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Content-Type', 'application/json');
 
@@ -151,44 +251,38 @@ const server = http.createServer((req, res) => {
             res.end(JSON.stringify(vitals));
         } else if (req.url === '/docker') {
             if (!checkRateLimit(req, res)) return;
-            const [statsOut, psOut] = await Promise.all([
-                runCmd("docker stats --no-stream --format '{{json .}}'"),
-                runCmd("docker ps -a --format '{\"Name\":\"{{.Names}}\", \"Status\":\"{{.Status}}\"}'")
-            ]);
-
-            if (!statsOut) {
-                console.error(`[DEBUG] /api/docker failed to fetch statsOut`);
-                res.writeHead(500);
-                return res.end(JSON.stringify({ error: 'Failed to fetch docker stats' }));
-            }
-
             try {
-				const stats = statsOut.split('\n').filter(Boolean).map(JSON.parse);
-				const psInfo = psOut ? psOut.split('\n').filter(Boolean).map(JSON.parse) : [];
-
-				// Merge Status into stats
-				stats.forEach(stat => {
-					const psMatch = psInfo.find(p => p.Name === stat.Name);
-					stat.Status = psMatch ? psMatch.Status : 'Unknown';
-
-					// Attach git branch if it's a public app
-					const nameLower = stat.Name.toLowerCase();
-					const pathKey = Object.keys(CONTAINER_PATHS).find(k => nameLower.includes(k.toLowerCase()));
-					if (pathKey) {
-						const branch = getGitBranch(CONTAINER_PATHS[pathKey]);
-						if (branch) {
-							stat.Branch = branch;
-						}
-					}
-				});
-
+                const stats = await fetchDockerStatsAndCache();
                 res.writeHead(200);
                 res.end(JSON.stringify(stats));
             } catch (e) {
-                console.error(`[DEBUG] /api/docker JSON parse error: ${e.message}`);
+                log('error', `Failed to fetch/parse docker stats`, { error: e.message });
                 res.writeHead(500);
-                res.end(JSON.stringify({ error: 'Failed to parse docker stats' }));
+                res.end(JSON.stringify({ error: 'Failed to fetch docker stats' }));
             }
+        } else if (req.url === '/metrics') {
+            const memory = process.memoryUsage();
+            let body = '';
+            
+            body += '# HELP node_process_uptime_seconds Uptime of the Node.js process in seconds.\n';
+            body += '# TYPE node_process_uptime_seconds gauge\n';
+            body += `node_process_uptime_seconds ${process.uptime()}\n\n`;
+            
+            body += '# HELP node_process_memory_usage_bytes Memory usage of the Node.js process in bytes.\n';
+            body += '# TYPE node_process_memory_usage_bytes gauge\n';
+            body += `node_process_memory_usage_bytes{type="rss"} ${memory.rss}\n`;
+            body += `node_process_memory_usage_bytes{type="heapTotal"} ${memory.heapTotal}\n`;
+            body += `node_process_memory_usage_bytes{type="heapUsed"} ${memory.heapUsed}\n\n`;
+            
+            body += '# HELP http_requests_total Total number of HTTP requests.\n';
+            body += '# TYPE http_requests_total counter\n';
+            for (const [key, count] of metrics.requestsTotal.entries()) {
+                const [method, endpoint, status] = key.split(':');
+                body += `http_requests_total{method="${method}",endpoint="${endpoint}",status="${status}"} ${count}\n`;
+            }
+            
+            res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+            res.end(body);
         } else if (req.url === '/health') {
             res.writeHead(200);
             res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
@@ -200,5 +294,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`Vitals API running on port ${PORT}`);
+    log('info', `Vitals API running on port ${PORT}`);
 });
