@@ -6,9 +6,9 @@ Planned improvements and future work items.
 
 ## High Priority
 
-- [ ] **Update `CONTAINER_PATHS`** — Change relative paths (`../..`) to absolute Docker mount paths (`/homeserver/apps/...`) to match the volume mount in `docker-compose.yml`
-- [ ] **Add rate limiting** — Prevent abuse on `/vitals` and `/docker` endpoints (both shell out to system commands)
-- [ ] **Add request timeout** — Set maximum execution time for `docker stats` and `docker ps` commands to prevent hanging
+- [x] **Update `CONTAINER_PATHS`** — Change relative paths (`../..`) to absolute Docker mount paths (`/homeserver/apps/...`) to match the volume mount in `docker-compose.yml`
+- [x] **Add rate limiting** — Prevent abuse on `/vitals` and `/docker` endpoints (both shell out to system commands)
+- [x] **Add request timeout** — Set maximum execution time for `docker stats` and `docker ps` commands to prevent hanging
 
 ## Medium Priority
 

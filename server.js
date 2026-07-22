@@ -8,17 +8,28 @@ const fs = require('fs');
 const PORT = 3002;
 
 const CONTAINER_PATHS = {
-    'homeserver-fe': '../fe-homeserver',
-    'homeserver-be': '.',
-    'twc-fe': '../../the-wine-corner/fe-the-wine-corner',
-    'twc-be': '../../the-wine-corner/be-the-wine-corner',
-    'yp-fe': '../../your-places/fe-your-places',
-    'yp-be': '../../your-places/be-your-places'
+    'homeserver-fe': '/homeserver/apps/homeserver/fe-homeserver',
+    'homeserver-be': '/homeserver/apps/homeserver/be-homeserver',
+    'twc-fe': '/homeserver/apps/the-wine-corner/fe-the-wine-corner',
+    'twc-be': '/homeserver/apps/the-wine-corner/be-the-wine-corner',
+    'yp-fe': '/homeserver/apps/your-places/fe-your-places',
+    'yp-be': '/homeserver/apps/your-places/be-your-places'
 };
 
-const getGitBranch = (relativeDir) => {
+const getGitBranch = (targetPath) => {
     try {
-        const gitHeadPath = path.join(__dirname, relativeDir, '.git', 'HEAD');
+        let resolvedPath = targetPath;
+        if (path.isAbsolute(targetPath)) {
+            // Local fallback logic
+            if (!fs.existsSync('/homeserver') && targetPath.startsWith('/homeserver/')) {
+                const workspaceRoot = path.resolve(__dirname, '../../..');
+                resolvedPath = targetPath.replace(/^\/homeserver/, workspaceRoot);
+            }
+        } else {
+            resolvedPath = path.resolve(__dirname, targetPath);
+        }
+
+        const gitHeadPath = path.join(resolvedPath, '.git', 'HEAD');
         if (!fs.existsSync(gitHeadPath)) return null;
         const data = fs.readFileSync(gitHeadPath, 'utf8').trim();
         if (data.startsWith('ref: refs/heads/')) {
@@ -31,8 +42,8 @@ const getGitBranch = (relativeDir) => {
     }
 };
 
-const runCmd = (cmd) => new Promise(resolve => {
-    exec(cmd, (error, stdout, stderr) => {
+const runCmd = (cmd, timeoutMs = 5000) => new Promise(resolve => {
+    exec(cmd, { timeout: timeoutMs }, (error, stdout, stderr) => {
         if (error) {
             console.error(`[DEBUG] Command failed: ${cmd}\nError: ${error.message}\nStderr: ${stderr}`);
             resolve(null);
@@ -41,6 +52,62 @@ const runCmd = (cmd) => new Promise(resolve => {
         }
     });
 });
+
+// Simple memory-based Rate Limiting implementation
+const rateLimitStore = new Map();
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+const RATE_LIMIT_MAX = 100; // 100 requests per window (safe for multiple tabs & refreshes)
+
+const getClientIp = (req) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+    return req.socket.remoteAddress;
+};
+
+const checkRateLimit = (req, res) => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    
+    if (!rateLimitStore.has(ip)) {
+        rateLimitStore.set(ip, []);
+    }
+    
+    const timestamps = rateLimitStore.get(ip);
+    const active = timestamps.filter(time => now - time < RATE_LIMIT_WINDOW_MS);
+    
+    if (active.length >= RATE_LIMIT_MAX) {
+        rateLimitStore.set(ip, active);
+        const oldestActive = active[0];
+        const resetTimeMs = oldestActive + RATE_LIMIT_WINDOW_MS;
+        const retryAfterSeconds = Math.max(1, Math.ceil((resetTimeMs - now) / 1000));
+        
+        res.writeHead(429, {
+            'Retry-After': String(retryAfterSeconds),
+            'Content-Type': 'application/json'
+        });
+        res.end(JSON.stringify({ error: 'Too many requests, please try again later.' }));
+        return false;
+    }
+    
+    active.push(now);
+    rateLimitStore.set(ip, active);
+    return true;
+};
+
+// Periodic memory cleanup of rate limit store to prevent memory leaks
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, timestamps] of rateLimitStore.entries()) {
+        const active = timestamps.filter(time => now - time < RATE_LIMIT_WINDOW_MS);
+        if (active.length === 0) {
+            rateLimitStore.delete(ip);
+        } else {
+            rateLimitStore.set(ip, active);
+        }
+    }
+}, 60000).unref();
 
 const logger = morgan('dev');
 
@@ -55,6 +122,7 @@ const server = http.createServer((req, res) => {
         res.setHeader('Content-Type', 'application/json');
 
         if (req.url === '/vitals') {
+            if (!checkRateLimit(req, res)) return;
             const load = os.loadavg();
             const cpus = os.cpus().length;
             const totalMem = os.totalmem();
@@ -82,6 +150,7 @@ const server = http.createServer((req, res) => {
             res.writeHead(200);
             res.end(JSON.stringify(vitals));
         } else if (req.url === '/docker') {
+            if (!checkRateLimit(req, res)) return;
             const [statsOut, psOut] = await Promise.all([
                 runCmd("docker stats --no-stream --format '{{json .}}'"),
                 runCmd("docker ps -a --format '{\"Name\":\"{{.Names}}\", \"Status\":\"{{.Status}}\"}'")
