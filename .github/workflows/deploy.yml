@@ -1,41 +1,125 @@
-name: Build and Push to GHCR
+name: Deploy Production
+run-name: "Deploy Production — branch ${{ inputs.ref != '' && inputs.ref || github.ref_name }}${{ inputs.title != '' && format(' | {0}', inputs.title) || '' }}"
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'commit SHA (optional)'
+        required: false
+        default: ''
+      title:
+        description: 'label (optional)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Resolve ref
+        id: resolve
+        run: |
+          REF="${{ inputs.ref }}"
+          if [ -z "$REF" ]; then
+            REF="${{ github.ref_name }}"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
+      - name: Find previous successful deployment
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV_SHA=$(gh run list --workflow "${{ github.workflow }}" --status success --limit 1 --json headSha --jq '.[0].headSha' 2>/dev/null || echo "")
+          echo "sha=$PREV_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout ${{ steps.resolve.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### Deploying \`homeserver-be\`"
+            echo "- **Ref input:** \`${{ inputs.ref != '' && inputs.ref || '(none — deployed latest commit on selected branch)' }}\`"
+            echo "- **Deploying:** \`${{ steps.resolve.outputs.ref }}\`"
+            echo "- **Commit:** \`$(git rev-parse HEAD)\` ($(git log -1 --pretty=%s))"
+            echo "- **Author:** $(git log -1 --pretty='%an')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${{ steps.previous.outputs.sha }}" ]; then
+            {
+              echo "- **Previously deployed:** \`${{ steps.previous.outputs.sha }}\`"
+              echo ""
+              echo "**Commits since last deploy:**"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            git log --oneline "${{ steps.previous.outputs.sha }}..HEAD" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null \
+              || echo "(no previous commit found in history — can't compute diff)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- No prior successful deployment on record (first success, or earlier runs failed)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest
-            type=sha
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ghcr.io/fahmiefendy/be-homeserver:latest
+            ghcr.io/fahmiefendy/be-homeserver:${{ steps.vars.outputs.sha_short }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+      - name: Open Cloudflare Access tunnel to VPS
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          cloudflared access tcp --hostname ssh.fahmiefendy.dev --url localhost:2222 &
+          sleep 5
+
+      - name: Update backend .env on VPS
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.BE_ENV_FILE }}" | base64 -d | \
+            ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -p 2222 gh-deploy@localhost \
+              "/home/fahmi/homeserver/apps/homeserver/update-be-env.sh"
+
+      - name: Deploy on VPS
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -p 2222 gh-deploy@localhost \
+            "/home/fahmi/homeserver/apps/homeserver/deploy.sh homeserver-be"
